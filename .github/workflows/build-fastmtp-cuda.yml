@@ -1,0 +1,263 @@
+name: Build llama.cpp with CUDA (HauhauCS FastMTP)
+
+on:
+  workflow_dispatch:
+
+# Pinned upstream commit + HauhauCS FastMTP patch. This build targets a fixed
+# llama.cpp revision (not the latest release), so there is no new-release
+# detection — it always builds the same source.
+env:
+  LLAMA_REPO: https://github.com/ggerganov/llama.cpp
+  LLAMA_COMMIT: 4df29be4f4c3673f428170fda944a5b19f743bb8
+  PATCH_URL: https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main/HauhauCS-FastMTP-llama.cpp.patch
+  PATCH_FILE: HauhauCS-FastMTP-llama.cpp.patch
+  RELEASE_TAG: fastmtp-4df29be
+
+jobs:
+  build:
+    runs-on: ${{ matrix.arch.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.8.1']
+        arch:
+          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
+          # multi-arch on Docker Hub so the same build path runs on both.
+          - { suffix: amd64, runs_on: ubuntu-latest }
+          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
+        include:
+          - cuda_version: '12.8.1'
+            cuda_version_short: '12.8'
+            cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
+            # CUDA compute capabilities target the runtime GPU, not the host
+            # CPU arch, so the same list applies to both amd64 and arm64
+            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
+            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
+            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        run: |
+          echo "=== Initial Disk Space ==="
+          df -h
+
+          echo "=== Removing unnecessary packages ==="
+          sudo apt-get remove -y '^aspnetcore-.*' || true
+          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
+          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+          sudo apt-get remove -y 'php.*' --fix-missing || true
+          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
+          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+
+          echo "=== Removing large directories ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          # Clean docker system
+          docker system prune -af || true
+
+          echo "=== After Cleanup ==="
+          df -h
+
+      - name: Build llama.cpp with CUDA
+        run: |
+          # Pull Docker image
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+
+          # Run build in container
+          docker run --rm \
+            -v $PWD:/workspace \
+            nvidia/cuda:${{ matrix.cuda_tag }} \
+            bash -c "
+              set -e
+
+              echo '=== Installing minimal dependencies ==='
+              apt-get update -qq
+              apt-get install -y --no-install-recommends git curl cmake ninja-build build-essential libssl-dev ca-certificates
+              apt-get clean
+              rm -rf /var/lib/apt/lists/*
+
+              echo '=== Cloning llama.cpp (pinned commit) ==='
+              cd /workspace
+              git clone ${{ env.LLAMA_REPO }}
+              cd llama.cpp
+              git checkout ${{ env.LLAMA_COMMIT }}
+
+              echo '=== Downloading HauhauCS FastMTP patch ==='
+              curl -L -o ${{ env.PATCH_FILE }} '${{ env.PATCH_URL }}'
+              git apply --check ${{ env.PATCH_FILE }}
+              git apply ${{ env.PATCH_FILE }}
+
+              echo '=== Configuring build with Ninja ==='
+              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+              cmake -B build -S . \
+                -G Ninja \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=ON \
+                -DGGML_NATIVE=OFF \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+
+              echo '=== Building with Ninja (parallel: all cores) ==='
+              cmake --build build --config Release -j\$(nproc)
+
+              echo '=== Copying binaries ==='
+              cd /workspace
+              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+
+              # Copy everything from build/bin
+              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+
+              # Strip binaries to reduce size (executables only, not .so files)
+              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+
+              echo '=== Creating version info ==='
+              echo 'llama.cpp commit: ${{ env.LLAMA_COMMIT }} (HauhauCS FastMTP patch applied)' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Patch: ${{ env.PATCH_URL }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+
+              echo '=== Build complete ==='
+              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
+
+              echo '=== Cleaning up build directory ==='
+              rm -rf llama.cpp
+            "
+
+          # Remove Docker image to free space
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+
+          # Fix permissions for files created by root in container
+          sudo chown -R $(id -u):$(id -g) $PWD
+
+          echo "=== Final disk usage ==="
+          df -h
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf llama.cpp-${{ env.RELEASE_TAG }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Arch suffix in the artifact name so the matrix jobs do not collide
+          # in actions/download-artifact later.
+          name: llama.cpp-${{ env.RELEASE_TAG }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          path: binaries/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so the tag push below is a fast-forward and
+          # duplicate tags are visible.
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Delete existing release and tag (re-runs)
+        # The source revision is pinned, so the release tag is fixed. Deleting
+        # any previous release/tag makes manual re-runs idempotent instead of
+        # failing on "tag already exists".
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ env.RELEASE_TAG }}" --yes || true
+          git push origin ":refs/tags/${{ env.RELEASE_TAG }}" || true
+
+      - name: Create advancing release tag
+        # GitHub sorts the /releases list by each release's created_at, which is
+        # the *committer date of the tag's target commit* — not the publish
+        # time. Anchor the tag to a fresh empty commit whose committer date is
+        # build time so created_at advances on every re-run. The commit is
+        # reachable only via its tag; main is never pushed.
+        run: |
+          set -euo pipefail
+          TAG="${{ env.RELEASE_TAG }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git tag "${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: llama.cpp with CUDA — HauhauCS FastMTP (4df29be)
+          body: |
+            # llama.cpp with CUDA Support — HauhauCS FastMTP build
+
+            Pre-built binaries of llama.cpp with CUDA support, pinned to a
+            specific upstream commit with the HauhauCS FastMTP patch applied.
+
+            **Source:** https://github.com/ggerganov/llama.cpp/tree/4df29be4f4c3673f428170fda944a5b19f743bb8
+            **Commit:** 4df29be4f4c3673f428170fda944a5b19f743bb8
+            **Patch:** [HauhauCS-FastMTP-llama.cpp.patch](https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main/HauhauCS-FastMTP-llama.cpp.patch)
+
+            ## CUDA Versions
+            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
+
+            ## Host architectures
+            Tarballs are published per host CPU architecture (Linux):
+            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
+            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
+
+            ## GPU compute capability reference
+            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
+            - 8.0: A100
+            - 8.6: RTX 3000 series
+            - 8.9: RTX 4000 series, L4, L40
+            - 9.0: H100, H200, GH200
+            - 10.0: B200, GB200
+            - 12.0: RTX Pro series, RTX 50xx
+
+            ## Usage
+            Download the tarball matching your host CPU arch and CUDA version, then extract:
+            ```bash
+            # amd64 host
+            tar -xzf llama.cpp-${{ env.RELEASE_TAG }}-cuda-12.8-amd64.tar.gz
+            # arm64 host (e.g. Grace Blackwell)
+            tar -xzf llama.cpp-${{ env.RELEASE_TAG }}-cuda-12.8-arm64.tar.gz
+            ./llama-cli --help
+            ```
+          files: release-assets/*
+          draft: false
+          prerelease: false
