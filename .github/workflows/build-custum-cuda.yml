@@ -1,0 +1,412 @@
+name: Build llama.cpp (DFlash2, PR #27342) with CUDA
+
+# DFlash2 (grouped dynamic depthwise convolution + candidate selector) is not
+# merged upstream yet; it lives in ggml-org/llama.cpp PR #27342. This workflow
+# builds the PR branch head and keys the build identity (tag, tarball name,
+# dedup check) on the PR head sha — not on llama.cpp release tags, which can
+# never see PR branch updates. When the PR merges, revert check-release to
+# track upstream releases again.
+
+# NOTE: This workflow is fully self-contained. The container build script and the
+# DFlash2 vision patch are materialised at run time by the 'Write build script'
+# step below - no other files need to be uploaded alongside this one.
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new PR head'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_hash: ${{ steps.check.outputs.release_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check PR #27342 head for changes
+        id: check
+        run: |
+          # Build identity = PR head sha, so a PR update always produces a new
+          # tag and artifacts never carry stale code under a release's name.
+          PR_SHA=$(git ls-remote https://github.com/ggml-org/llama.cpp.git pull/27342/head | cut -f1)
+          if [ -z "$PR_SHA" ]; then
+            echo "::error::pull/27342/head did not resolve - PR #27342 was merged or closed. Revert this workflow to release-based builds."
+            exit 1
+          fi
+          SHORT_SHA=${PR_SHA:0:7}
+          TAG="dflash2-${SHORT_SHA}"
+
+          echo "PR #27342 head: $PR_SHA"
+          echo "Build tag: $TAG"
+
+          # Check if we've already built this PR head
+          if git tag | grep -q "^${TAG}$"; then
+            echo "PR head $TAG already built"
+            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+              echo "Force build enabled, building anyway"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "New PR head detected: $TAG"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "release_hash=$PR_SHA" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ${{ matrix.arch.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.8.1']
+        arch:
+          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
+          # multi-arch on Docker Hub so the same build path runs on both.
+          - { suffix: amd64, runs_on: ubuntu-latest }
+          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
+        include:
+          - cuda_version: '12.8.1'
+            cuda_version_short: '12.8'
+            cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
+            # CUDA compute capabilities target the runtime GPU, not the host
+            # CPU arch, so the same list applies to both amd64 and arm64
+            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
+            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
+            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
+
+    steps:
+      - name: Write build script and DFlash2 vision patch
+        run: |
+          mkdir -p scripts patches
+          cat > scripts/build-cuda.sh << 'BUILD_SCRIPT_EOF'
+          #!/usr/bin/env bash
+          # Build llama.cpp (PR #27342, DFlash2) with CUDA inside the nvidia/cuda devel
+          # container. Invoked from build-cuda.yml with the repo mounted at /workspace:
+          #
+          #   docker run --rm -v $PWD:/workspace \
+          #     -e EXPECTED_SHA -e CUDA_ARCHS -e CUDA_VERSION -e CUDA_VERSION_SHORT \
+          #     nvidia/cuda:<tag> bash /workspace/scripts/build-cuda.sh
+          #
+          # Parameters arrive via the environment so no quoting/variable expansion
+          # crosses the YAML -> shell -> docker boundary.
+          set -euo pipefail
+
+          : "${EXPECTED_SHA:?PR head sha (check-release outputs.release_hash) required}"
+          : "${CUDA_ARCHS:?CMAKE_CUDA_ARCHITECTURES list required}"
+          : "${CUDA_VERSION:?e.g. 12.8.1}"
+          : "${CUDA_VERSION_SHORT:?e.g. 12.8}"
+
+          echo '=== Installing minimal dependencies ==='
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          echo '=== Cloning llama.cpp (PR #27342: DFlash2) ==='
+          cd /workspace
+          # The release-tag clone fallback does not work for PR refs, so fetch the PR
+          # head explicitly (shallow) and detach onto it.
+          git clone --no-checkout --depth 1 https://github.com/ggml-org/llama.cpp.git
+          cd llama.cpp
+          git fetch --depth 1 origin "${EXPECTED_SHA}" || \
+            git fetch --depth 1 origin pull/27342/head
+          git checkout --detach FETCH_HEAD
+
+          # Never publish artifacts whose content differs from the build identity
+          # computed by check-release.
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "Checked out: ${HEAD_SHA}"
+          if [ "${HEAD_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo '::error::HEAD does not match the expected PR head - PR #27342 was updated mid-run; re-run the workflow.'
+            exit 1
+          fi
+
+          echo '=== Applying vision fix (patches/dflash2-vision.patch) ==='
+          # Fixes vision/multimodal requests with draft-dflash: a multimodal target
+          # batch is M-RoPE and the 1D draft context rejects the non-continuous
+          # positions copied from the target (llama_decode(ctx_dft) rc=-1, request
+          # dropped). See the PR #27342 discussion. --3way tolerates context drift when
+          # the PR is rebased; plain apply is the fallback if the pre-image blob is not
+          # in the shallow history.
+          git apply --stat /workspace/patches/dflash2-vision.patch
+          git apply --3way /workspace/patches/dflash2-vision.patch || \
+            git apply /workspace/patches/dflash2-vision.patch
+          git diff HEAD --stat
+
+          echo '=== Configuring build with Ninja ==='
+          export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          cmake -B build -S . \
+            -G Ninja \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+
+          echo '=== Building with Ninja (parallel: all cores) ==='
+          cmake --build build --config Release -j"$(nproc)"
+
+          echo '=== Copying binaries ==='
+          cd /workspace
+          mkdir -p "binaries/cuda-${CUDA_VERSION_SHORT}"
+
+          # Copy everything from build/bin
+          cp -r llama.cpp/build/bin/* "binaries/cuda-${CUDA_VERSION_SHORT}/"
+
+          # Strip binaries to reduce size (executables only, not .so files)
+          find "binaries/cuda-${CUDA_VERSION_SHORT}/" -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+
+          echo '=== Creating version info ==='
+          {
+            echo "llama.cpp source: PR #27342 (DFlash2) @ ${EXPECTED_SHA}"
+            echo 'Patch: vision fix (dense per-sequence draft positions for M-RoPE targets) embedded in build-cuda.yml'
+            echo "CUDA version: ${CUDA_VERSION}"
+            echo "Architectures: ${CUDA_ARCHS}"
+            echo "Build date: $(date -u +%Y-%m-%d)"
+          } > "binaries/cuda-${CUDA_VERSION_SHORT}/VERSION.txt"
+
+          echo '=== Build complete ==='
+          ls -lh "binaries/cuda-${CUDA_VERSION_SHORT}/"
+
+          echo '=== Cleaning up build directory ==='
+          rm -rf llama.cpp
+          BUILD_SCRIPT_EOF
+          cat > patches/dflash2-vision.patch << 'VISION_PATCH_EOF'
+          diff --git a/common/speculative.cpp b/common/speculative.cpp
+          index b69ab19515c346426017ba960d4b8c6a3ce8b463..00933c2d2c975b5f2dfce026b19307bbf531c4b1 100644
+          --- a/common/speculative.cpp
+          +++ b/common/speculative.cpp
+          @@ -1135,4 +1135,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                       batch_inject.n_tokens = n_chunk;
+                       std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+          +            // A multimodal target batch is M-RoPE: batch_in.pos holds position tuples
+          +            // (n_pos_per_embd == 4) and an image span repeats the temporal component
+          +            // across its tokens. ctx_dft has n_pos_per_embd == 1 and llama_batch_allocr
+          +            // then demands strictly continuous positions per sequence, so copying
+          +            // batch_in.pos verbatim makes llama_decode(ctx_dft) reject the batch with
+          +            // rc=-1 and drops vision requests. The draft keeps its own KV cache and
+          +            // only needs the row order to match, so number the injected rows densely
+          +            // per sequence. For a text-only batch the target positions are already
+          +            // dense and this is a no-op.
+          +            std::vector<llama_pos> pos_next(n_seq, -1);
+                       for (int32_t i = 0; i < n_chunk; ++i) {
+                           const int32_t j = offset + i;
+          @@ -1140,5 +1150,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                           const llama_seq_id seq_id = batch_in.seq_id[j][0];
+                           GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+          -                batch_inject.pos[i]       = batch_in.pos[j];
+          +                if (pos_next[seq_id] < 0) {
+          +                    pos_next[seq_id] = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) + 1;
+          +                }
+          +                batch_inject.pos[i]       = pos_next[seq_id]++;
+                           batch_inject.n_seq_id[i]  = 1;
+                           batch_inject.seq_id[i][0] = seq_id;
+          VISION_PATCH_EOF
+          # YAML block scalars normalise CRLF to LF, so the generated files
+          # are already LF; sanity-check the script syntax before mounting.
+          bash -n scripts/build-cuda.sh
+
+      - name: Maximize build space
+        run: |
+          echo "=== Initial Disk Space ==="
+          df -h
+
+          echo "=== Removing unnecessary packages ==="
+          sudo apt-get remove -y '^aspnetcore-.*' || true
+          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
+          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+          sudo apt-get remove -y 'php.*' --fix-missing || true
+          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
+          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+
+          echo "=== Removing large directories ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          # Clean docker system
+          docker system prune -af || true
+
+          echo "=== After Cleanup ==="
+          df -h
+
+      - name: Build llama.cpp with CUDA
+        run: |
+          # Pull Docker image
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+
+          # Run the build in the container. The build script lives in the repo
+          # (mounted at /workspace) and takes its parameters via -e, so no
+          # quoting or variable expansion crosses the YAML -> shell -> docker
+          # boundary.
+          docker run --rm \
+            -v $PWD:/workspace \
+            -e EXPECTED_SHA='${{ needs.check-release.outputs.release_hash }}' \
+            -e CUDA_ARCHS='${{ matrix.architectures }}' \
+            -e CUDA_VERSION='${{ matrix.cuda_version }}' \
+            -e CUDA_VERSION_SHORT='${{ matrix.cuda_version_short }}' \
+            nvidia/cuda:${{ matrix.cuda_tag }} \
+            bash /workspace/scripts/build-cuda.sh
+
+          # Remove Docker image to free space
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+
+          # Fix permissions for files created by root in container
+          sudo chown -R $(id -u):$(id -g) $PWD
+
+          echo "=== Final disk usage ==="
+          df -h
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Arch suffix in the artifact name so the matrix jobs do not collide
+          # in actions/download-artifact later.
+          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          path: binaries/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so the tag push below is a fast-forward and
+          # duplicate tags are visible.
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Create advancing release tag
+        # GitHub sorts the /releases list by each release's created_at, which is
+        # the *committer date of the tag's target commit* — not the publish
+        # time. Previously softprops/action-gh-release created every tag at the
+        # static main HEAD (unchanged since May 2026), so every release reported
+        # the same created_at and the /releases list stopped reflecting recency:
+        # API consumers polling the first page never saw newer builds. Anchor
+        # each tag to a fresh empty commit whose committer date is build time so
+        # created_at advances and new releases sort to the top of the list.
+        # The commit is reachable only via its tag; main is never pushed.
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          # force_build rebuilds the same PR head under the same tag: the tag
+          # already exists locally (fetch-depth: 0) and on origin, so plain
+          # git tag/push would fail under set -e. Force-move it to the fresh
+          # build commit; action-gh-release updates the existing release's
+          # assets in place.
+          git tag -f "${TAG}"
+          git push -f origin "refs/tags/${TAG}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} (DFlash2) with CUDA
+          body: |
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+
+            Pre-built llama.cpp with CUDA, built from [PR #27342 — spec: add DFlash2 support (local convolution + candidate selector)](https://github.com/ggml-org/llama.cpp/pull/27342), with the vision fix from the PR discussion applied.
+
+            **Commit:** ${{ needs.check-release.outputs.release_hash }}
+            **Patch:** embedded in this workflow — fixes vision/multimodal requests with `draft-dflash`. A multimodal target batch is M-RoPE, and the draft context (`n_pos_per_embd == 1`) rejects the non-continuous positions copied verbatim from the target, so `llama_decode(ctx_dft)` failed with `rc=-1` and the request was dropped. The patch numbers the injected draft rows densely per sequence (a no-op for text-only batches, where target positions are already dense).
+
+            ## Usage (DFlash2)
+
+            ```bash
+            ./llama-server \
+              -hf  ggml-org/Qwen3.8-27B-GGUF:Q4_K_M \
+              -hfd incoai/Qwen3.8-27B-DFlash2-GGUF:Q4_K_M \
+              --spec-type draft-dflash \
+              --spec-draft-n-max 7
+            ```
+
+            Notes from the PR discussion:
+            - `--spec-draft-n-max 7` was tuned on H100/H200-class GPUs; on older hardware (e.g. V100) 4–5 measured faster — sweep it for your GPU.
+            - `Q4_K_M` is the recommended drafter quant; `Q8_0` costs ~0.9 GiB more VRAM and measured slower on several setups.
+            - Speculative decoding is currently a single-stream optimization: aggregate throughput regresses at `--parallel >= 2` (under investigation upstream).
+            - Vision (mmproj) requests work with this build thanks to the patch above.
+
+            ## CUDA Versions
+            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
+
+            ## Host architectures
+            Tarballs are published per host CPU architecture (Linux):
+            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
+            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
+
+            ## GPU compute capability reference
+            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
+            - 8.0: A100
+            - 8.6: RTX 3000 series
+            - 8.9: RTX 4000 series, L4, L40
+            - 9.0: H100, H200, GH200
+            - 10.0: B200, GB200
+            - 12.0: RTX Pro series, RTX 50xx
+
+            ## Usage
+            Download the tarball matching your host CPU arch and CUDA version, then extract:
+            ```bash
+            # amd64 host
+            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
+            # arm64 host (e.g. Grace Blackwell)
+            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
+            ./llama-cli --help
+            ```
+          files: release-assets/*
+          draft: false
+          prerelease: false
