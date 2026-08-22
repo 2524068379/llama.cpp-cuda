@@ -115,154 +115,131 @@ jobs:
         run: |
           # Pull Docker image
           docker pull nvidia/cuda:${{ matrix.cuda_tag }}
-          
+
+          # Generate build script inside workspace
+          cat << 'DOCKER_BUILD_EOF' > ./build_in_container.sh
+          set -e
+
+          echo '=== Installing minimal dependencies ==='
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates python3
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          echo '=== Cloning llama.cpp ==='
+          cd /workspace
+          git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
+            (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
+          cd llama.cpp
+
+          echo '=== Applying inline patches (#22238, #27428) ==='
+          python3 -c '
+          import os, re
+
+          # Patch 1: Discussion #22238 - Set cudaDeviceScheduleBlockingSync to prevent 100% CPU spinning
+          cuda_file = "ggml/src/ggml-cuda/ggml-cuda.cu"
+          if os.path.exists(cuda_file):
+              with open(cuda_file, "r", encoding="utf-8") as f:
+                  src = f.read()
+              if "cudaDeviceScheduleBlockingSync" not in src:
+                  target = "// Temporary performance fix:\n        // Setting device scheduling strategy for iGPUs with cc121"
+                  repl = "// Fix for 100% CPU busy-spin (#22238): switch CUDA schedule to blocking sync\n        CUDA_CHECK(cudaSetDevice(physical_id));\n        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));\n\n        " + target
+                  if target in src:
+                      src = src.replace(target, repl, 1)
+                  else:
+                      m = re.search(r"([ \t]*)(if\s*\(\s*prop\.major\s*==\s*12\s*&&\s*prop\.minor\s*==\s*1\s*\))", src)
+                      if m:
+                          src = src[:m.start()] + m.group(1) + "CUDA_CHECK(cudaSetDevice(physical_id));\n" + m.group(1) + "CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));\n\n" + src[m.start():]
+                  with open(cuda_file, "w", encoding="utf-8") as f:
+                      f.write(src)
+                  print("Applied CUDA blocking sync patch (#22238)")
+
+          # Patch 2: Issue #27428 - Fix draft-mtp prefill speed degradation on multi-GPU
+          spec_file = "common/speculative.cpp"
+          if os.path.exists(spec_file):
+              with open(spec_file, "r", encoding="utf-8") as f:
+                  src = f.read()
+              target_mtp = "llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);\n        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);"
+              repl_mtp = "// Fix for #27428: masked nextn\n        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ true);\n        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);"
+              src = src.replace(target_mtp, repl_mtp, 1)
+              dec_t = "if (!is_mem_shared) {\n            common_batch_clear(batch);"
+              dec_r = "if (!is_mem_shared) {\n            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);\n            if (h_tgt) {\n                common_batch_clear(batch);"
+              dec_end_t = "if (chain_heads) {\n                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes\n            }\n            if (!ok) {\n                return false;\n            }\n        }"
+              dec_end_r = "if (chain_heads) {\n                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes\n            }\n            if (!ok) {\n                return false;\n            }\n            }\n        }"
+              if dec_t in src and dec_end_t in src:
+                  src = src.replace(dec_t, dec_r, 1).replace(dec_end_t, dec_end_r, 1)
+              ver_t = "const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);\n                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);"
+              ver_r = "const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);\n                if (h != nullptr) {\n                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);\n                    std::memcpy(pending_h[seq_id].data(), h, row_bytes);\n                }"
+              if ver_t in src:
+                  src = src.replace(ver_t, ver_r, 1)
+                  src = src.replace("std::memcpy(pending_h[seq_id].data(),\n                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);", "")
+              src = src.replace("SPC_WRN(\"ctx_dft pos_max=%d < N-1=%d - \"", "SPC_DBG(\"ctx_dft pos_max=%d < N-1=%d - \"", 1)
+              with open(spec_file, "w", encoding="utf-8") as f:
+                  f.write(src)
+              print("Applied MTP multi-GPU prefill patch (#27428)")
+          '
+          git diff
+
+          echo '=== Configuring build with Ninja ==='
+          export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          cmake -B build -S . \
+            -G Ninja \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+
+          echo '=== Building with Ninja (parallel: all cores) ==='
+          cmake --build build --config Release -j$(nproc)
+
+          echo '=== Copying binaries ==='
+          cd /workspace
+          mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+
+          # Copy everything from build/bin
+          cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+
+          # Strip binaries to reduce size (executables only, not .so files)
+          find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+
+          echo '=== Creating version info ==='
+          echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+          echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+          echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+          echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+          echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+          echo 'Patches: #22238 (CUDA blocking sync), #27428 (multi-GPU draft-mtp prefill fix)' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+
+          echo '=== Build complete ==='
+          ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
+
+          echo '=== Cleaning up build directory ==='
+          rm -rf llama.cpp
+          DOCKER_BUILD_EOF
+
+          chmod +x ./build_in_container.sh
+
           # Run build in container
           docker run --rm \
             -v $PWD:/workspace \
             nvidia/cuda:${{ matrix.cuda_tag }} \
-            bash -c "
-              set -e
-              
-              echo '=== Installing minimal dependencies ==='
-              apt-get update -qq
-              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
-              apt-get clean
-              rm -rf /var/lib/apt/lists/*
-              
-              echo '=== Cloning llama.cpp ==='
-              cd /workspace
-              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
-                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
-              cd llama.cpp
-              
-              echo '=== Applying inline patches (#22238, #27428) ==='
-              sed -e 's/^              //' << 'PATCH_EOF' | git apply -v
-              diff --git a/common/speculative.cpp b/common/speculative.cpp
-              index 8461e41..7a961e0 100644
-              --- a/common/speculative.cpp
-              +++ b/common/speculative.cpp
-              @@ -1368,7 +1368,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                           }
-                       }
-               
-              -        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-              +        // Fix for #27428: use masked embeddings_nextn so prompt processing is not halved on multi-GPU
-              +        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ true);
-                       llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-               
-                       is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
-              @@ -1423,7 +1424,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                       const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-               
-                       if (pos_max < N - 1 && !is_mem_shared) {
-              -            SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
-              +            SPC_DBG("ctx_dft pos_max=%d < N-1=%d - "
-                                   "process() hook may not have run on every prefill ubatch "
-                                   "(need_embd / logits=1 on every prompt position?). "
-                                   "Drafts may degrade.\n",
-              @@ -1467,7 +1468,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-               
-                       // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-                       if (!is_mem_shared) {
-              -            common_batch_clear(batch);
-              +            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-              +            if (h_tgt) {
-              +                common_batch_clear(batch);
-               
-                           for (int k = 0; k < n_tokens; ++k) {
-                               common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-              @@ -1526,6 +1529,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-                           if (!ok) {
-                               return false;
-                           }
-              +            }
-                       }
-               
-                       for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-              @@ -1539,11 +1543,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-               
-                           for (int32_t i = 0; i < n_rows; ++i) {
-                               const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-              -                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-              +                if (h != nullptr) {
-              +                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-              +                    std::memcpy(pending_h[seq_id].data(), h, row_bytes);
-              +                }
-                           }
-              -
-              -            std::memcpy(pending_h[seq_id].data(),
-              -                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
-                       }
-               
-                       return true;
-              diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-              index a8a1c09..b88d6b7 100644
-              --- a/ggml/src/ggml-cuda/ggml-cuda.cu
-              +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-              @@ -360,6 +360,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
-                           turing_devices_without_mma.push_back({ id, device_name });
-                       }
-               
-              +        // Fix for 100% CPU busy-spin (#22238): switch CUDA schedule to blocking sync
-              +        CUDA_CHECK(cudaSetDevice(physical_id));
-              +        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
-              +
-                       // Temporary performance fix:
-                       // Setting device scheduling strategy for iGPUs with cc121 to \"spinning\" to avoid delays in cuda synchronize calls.
-                       // TODO: Check for future drivers the default scheduling strategy and
-              PATCH_EOF
-              git diff
-              
-              echo '=== Configuring build with Ninja ==='
-              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+            bash /workspace/build_in_container.sh
 
-              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-              cmake -B build -S . \
-                -G Ninja \
-                -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_SHARED_LIBS=ON \
-                -DGGML_NATIVE=OFF \
-                -DLLAMA_BUILD_TESTS=OFF \
-                -DLLAMA_BUILD_EXAMPLES=OFF \
-                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
-              
-              echo '=== Building with Ninja (parallel: all cores) ==='
-              cmake --build build --config Release -j\$(nproc)
-              
-              echo '=== Copying binaries ==='
-              cd /workspace
-              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+          rm -f ./build_in_container.sh
 
-              # Copy everything from build/bin
-              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
-
-              # Strip binaries to reduce size (executables only, not .so files)
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
-
-              echo '=== Creating version info ==='
-              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Patches: #22238 (CUDA blocking sync), #27428 (multi-GPU draft-mtp prefill fix)' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-
-              echo '=== Build complete ==='
-              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
-              
-              echo '=== Cleaning up build directory ==='
-              rm -rf llama.cpp
-            "
-          
           # Remove Docker image to free space
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          
+
           # Fix permissions for files created by root in container
           sudo chown -R $(id -u):$(id -g) $PWD
-          
+
           echo "=== Final disk usage ==="
           df -h
 
