@@ -1,0 +1,372 @@
+name: Build llama.cpp with CUDA
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_hash: ${{ steps.check.outputs.release_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new llama.cpp release
+        id: check
+        run: |
+          # Get latest release from llama.cpp
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
+          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
+          
+          echo "Latest llama.cpp release: $LATEST_RELEASE"
+          echo "Release hash: $RELEASE_HASH"
+          
+          # Check if we've already built this release
+          if git tag | grep -q "^${LATEST_RELEASE}$"; then
+            echo "Release $LATEST_RELEASE already built"
+            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+              echo "Force build enabled, building anyway"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "New release detected: $LATEST_RELEASE"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ${{ matrix.arch.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.8.1']
+        arch:
+          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
+          # multi-arch on Docker Hub so the same build path runs on both.
+          - { suffix: amd64, runs_on: ubuntu-latest }
+          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
+        include:
+          - cuda_version: '12.8.1'
+            cuda_version_short: '12.8'
+            cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
+            # CUDA compute capabilities target the runtime GPU, not the host
+            # CPU arch, so the same list applies to both amd64 and arm64
+            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
+            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
+            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        run: |
+          echo "=== Initial Disk Space ==="
+          df -h
+          
+          echo "=== Removing unnecessary packages ==="
+          sudo apt-get remove -y '^aspnetcore-.*' || true
+          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
+          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+          sudo apt-get remove -y 'php.*' --fix-missing || true
+          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
+          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          
+          echo "=== Removing large directories ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          
+          # Clean docker system
+          docker system prune -af || true
+          
+          echo "=== After Cleanup ==="
+          df -h
+
+      - name: Build llama.cpp with CUDA
+        run: |
+          # Pull Docker image
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+          
+          # Run build in container
+          docker run --rm \
+            -v $PWD:/workspace \
+            nvidia/cuda:${{ matrix.cuda_tag }} \
+            bash -c "
+              set -e
+              
+              echo '=== Installing minimal dependencies ==='
+              apt-get update -qq
+              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+              apt-get clean
+              rm -rf /var/lib/apt/lists/*
+              
+              echo '=== Cloning llama.cpp ==='
+              cd /workspace
+              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
+                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
+              cd llama.cpp
+              
+              echo '=== Applying inline patches (#22238, #27428) ==='
+              sed -e 's/^              //' << 'PATCH_EOF' | git apply -v
+              diff --git a/common/speculative.cpp b/common/speculative.cpp
+              index 8461e41..7a961e0 100644
+              --- a/common/speculative.cpp
+              +++ b/common/speculative.cpp
+              @@ -1368,7 +1368,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                           }
+                       }
+               
+              -        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+              +        // Fix for #27428: use masked embeddings_nextn so prompt processing is not halved on multi-GPU
+              +        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ true);
+                       llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+               
+                       is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+              @@ -1423,7 +1424,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                       const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+               
+                       if (pos_max < N - 1 && !is_mem_shared) {
+              -            SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
+              +            SPC_DBG("ctx_dft pos_max=%d < N-1=%d - "
+                                   "process() hook may not have run on every prefill ubatch "
+                                   "(need_embd / logits=1 on every prompt position?). "
+                                   "Drafts may degrade.\n",
+              @@ -1467,7 +1468,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+               
+                       // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+                       if (!is_mem_shared) {
+              -            common_batch_clear(batch);
+              +            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+              +            if (h_tgt) {
+              +                common_batch_clear(batch);
+               
+                           for (int k = 0; k < n_tokens; ++k) {
+                               common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+              @@ -1526,6 +1529,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                           if (!ok) {
+                               return false;
+                           }
+              +            }
+                       }
+               
+                       for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+              @@ -1539,11 +1543,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+               
+                           for (int32_t i = 0; i < n_rows; ++i) {
+                               const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+              -                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+              +                if (h != nullptr) {
+              +                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+              +                    std::memcpy(pending_h[seq_id].data(), h, row_bytes);
+              +                }
+                           }
+              -
+              -            std::memcpy(pending_h[seq_id].data(),
+              -                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                       }
+               
+                       return true;
+              diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+              index a8a1c09..b88d6b7 100644
+              --- a/ggml/src/ggml-cuda/ggml-cuda.cu
+              +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+              @@ -360,6 +360,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
+                           turing_devices_without_mma.push_back({ id, device_name });
+                       }
+               
+              +        // Fix for 100% CPU busy-spin (#22238): switch CUDA schedule to blocking sync
+              +        CUDA_CHECK(cudaSetDevice(physical_id));
+              +        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+              +
+                       // Temporary performance fix:
+                       // Setting device scheduling strategy for iGPUs with cc121 to \"spinning\" to avoid delays in cuda synchronize calls.
+                       // TODO: Check for future drivers the default scheduling strategy and
+              PATCH_EOF
+              git diff
+              
+              echo '=== Configuring build with Ninja ==='
+              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+              cmake -B build -S . \
+                -G Ninja \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=ON \
+                -DGGML_NATIVE=OFF \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+              
+              echo '=== Building with Ninja (parallel: all cores) ==='
+              cmake --build build --config Release -j\$(nproc)
+              
+              echo '=== Copying binaries ==='
+              cd /workspace
+              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+
+              # Copy everything from build/bin
+              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+
+              # Strip binaries to reduce size (executables only, not .so files)
+              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+
+              echo '=== Creating version info ==='
+              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Patches: #22238 (CUDA blocking sync), #27428 (multi-GPU draft-mtp prefill fix)' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+
+              echo '=== Build complete ==='
+              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
+              
+              echo '=== Cleaning up build directory ==='
+              rm -rf llama.cpp
+            "
+          
+          # Remove Docker image to free space
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+          
+          # Fix permissions for files created by root in container
+          sudo chown -R $(id -u):$(id -g) $PWD
+          
+          echo "=== Final disk usage ==="
+          df -h
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Arch suffix in the artifact name so the matrix jobs do not collide
+          # in actions/download-artifact later.
+          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          path: binaries/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so the tag push below is a fast-forward and
+          # duplicate tags are visible.
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Create advancing release tag
+        # GitHub sorts the /releases list by each release's created_at, which is
+        # the *committer date of the tag's target commit* — not the publish
+        # time. Previously softprops/action-gh-release created every tag at the
+        # static main HEAD (unchanged since May 2026), so every release reported
+        # the same created_at and the /releases list stopped reflecting recency:
+        # API consumers polling the first page never saw newer builds. Anchor
+        # each tag to a fresh empty commit whose committer date is build time so
+        # created_at advances and new releases sort to the top of the list.
+        # The commit is reachable only via its tag; main is never pushed.
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-release.outputs.release_tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git tag "${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
+          body: |
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+            
+            Pre-built binaries of llama.cpp with CUDA support for multiple CUDA versions.
+            
+            **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            **Commit:** ${{ needs.check-release.outputs.release_hash }}
+            
+            ## Included Patches
+            - **Discussion #22238:** Set `cudaDeviceScheduleBlockingSync` to eliminate 100% CPU single-core busy-wait during GPU offload.
+            - **Issue #27428:** Fix draft-mtp prompt processing halving speed on multi-GPU layer splits by using masked `embeddings_nextn` and null-safe embedding transfers.
+            ## CUDA Versions
+            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
+
+            ## Host architectures
+            Tarballs are published per host CPU architecture (Linux):
+            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
+            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
+
+            ## GPU compute capability reference
+            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
+            - 8.0: A100
+            - 8.6: RTX 3000 series
+            - 8.9: RTX 4000 series, L4, L40
+            - 9.0: H100, H200, GH200
+            - 10.0: B200, GB200
+            - 12.0: RTX Pro series, RTX 50xx
+
+            ## Usage
+            Download the tarball matching your host CPU arch and CUDA version, then extract:
+            ```bash
+            # amd64 host
+            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
+            # arm64 host (e.g. Grace Blackwell)
+            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
+            ./llama-cli --help
+            ```
+          files: release-assets/*
+          draft: false
+          prerelease: false
