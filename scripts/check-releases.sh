@@ -53,16 +53,18 @@ echo "Committed:     ${TIP_DATE}"
 echo ""
 
 # ---- This repo: does a release for this commit already exist? ----
-# Releases are tagged unsloth-iq1-narrow-<shortsha>.
+# Releases are tagged unsloth-iq1-narrow-<shortsha>. Use the exact-match
+# /releases/tags/{tag} endpoint (HTTP 200 vs 404) so this is robust no
+# matter how many releases accumulate (no pagination to worry about).
+# This mirrors the CI check-branch job's dedup logic.
 echo "Checking ${THIS_REPO} for an existing build of this commit..."
 CANDIDATE_TAG="unsloth-${UPSTREAM_BRANCH}-${SHORT_SHA}"
-OUR_TAG=$(curl -fsSL "https://api.github.com/repos/${THIS_REPO}/releases" \
-    | jq -r --arg tag "${CANDIDATE_TAG}" '.[] | select(.tag_name == $tag) | .tag_name' \
-    | head -1 || true)
+HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+    "https://api.github.com/repos/${THIS_REPO}/releases/tags/${CANDIDATE_TAG}")
 
-if [ -n "${OUR_TAG}" ]; then
+if [ "${HTTP_CODE}" = "200" ]; then
     echo -e "${GREEN}✓ Up to date!${NC}"
-    echo "Commit ${SHORT_SHA} has already been built (release tag ${OUR_TAG})."
+    echo "Commit ${SHORT_SHA} has already been built (release tag ${CANDIDATE_TAG}, HTTP ${HTTP_CODE})."
 else
     echo -e "${YELLOW}⚠ New build needed!${NC}"
     echo "Upstream ${UPSTREAM_BRANCH} is at ${SHORT_SHA} but no release tagged ${CANDIDATE_TAG} exists."

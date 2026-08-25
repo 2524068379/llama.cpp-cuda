@@ -29,9 +29,6 @@ jobs:
       short_sha: ${{ steps.check.outputs.short_sha }}
       release_tag: ${{ steps.check.outputs.release_tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Detect new iq1-narrow tip
         id: check
         env:
@@ -42,20 +39,21 @@ jobs:
         run: |
           set -euo pipefail
           UPSTREAM_API="${UPSTREAM_API#https://github.com/}"
+          # Auth bumps the GitHub API limit from 60 to 5000 req/h.
           AUTH=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
 
           # The unsloth fork publishes NO GitHub Releases, so the old
           # /releases/latest + git-tag dedup model does not apply. Instead we
           # track the branch tip commit SHA and de-duplicate against an
-          # existing RELEASE (via the Releases API), not a git tag.
+          # existing RELEASE.
           #
-          # Why Releases-API dedup instead of `git tag`?
-          #  - actions/checkout@v4 fetches NO tags by default, so `git tag`
-          #    would be empty and we would rebuild every single cron run.
-          #  - Gating on release existence means the check agrees with the
-          #    release job: if the tag was pushed but release creation failed
-          #    (orphaned tag), the next run still sees "no release" and
-          #    rebuilds/retries automatically — self-healing.
+          # This job is a pure API gate — NO actions/checkout. Dedup is via
+          # the exact-match endpoint /releases/tags/{tag} (HTTP 200 vs 404),
+          # which sidesteps all pagination concerns and never touches the
+          # local git tag store (so actions/checkout's --no-tags default is
+          # irrelevant). Gating on release existence also self-heals: if a tag
+          # was pushed but release creation failed (orphaned tag), the next
+          # run still sees 404 and rebuilds/retries.
           TIP_SHA=$(curl -fsSL "${AUTH[@]}" \
             "https://api.github.com/repos/${UPSTREAM_API}/branches/${UPSTREAM_BRANCH}" \
             | jq -r '.commit.sha // empty')
@@ -70,16 +68,14 @@ jobs:
           echo "iq1-narrow tip: ${TIP_SHA} (${SHORT_SHA})"
           echo "Candidate tag: ${TAG}"
 
-          # Query OUR releases for one tagged with this commit's tag.
-          # /releases returns [] (200) when empty, never 404, so this is robust
-          # under set -e. Mirrors scripts/check-releases.sh exactly.
-          EXISTING=$(curl -fsSL "${AUTH[@]}" \
-            "https://api.github.com/repos/${THIS_REPO}/releases?per_page=100" \
-            | jq -r --arg tag "${TAG}" '.[] | select(.tag_name == $tag) | .tag_name' \
-            | head -1)
+          # Exact-match: 200 = release exists, 404 = none. Single HTTP call,
+          # pagination-safe. -f still returns nonzero on 404, so read the code
+          # via -o /dev/null -w instead.
+          HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+            "https://api.github.com/repos/${THIS_REPO}/releases/tags/${TAG}")
 
-          if [ -n "${EXISTING}" ]; then
-            echo "Release ${TAG} already exists"
+          if [ "${HTTP_CODE}" = "200" ]; then
+            echo "Release ${TAG} already exists (HTTP ${HTTP_CODE})"
             if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
               echo "Force build enabled, building anyway"
               echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -87,7 +83,7 @@ jobs:
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "No release for ${TAG}; building"
+            echo "No release for ${TAG} (HTTP ${HTTP_CODE}); building"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
