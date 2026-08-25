@@ -1,4 +1,4 @@
-name: Build llama.cpp with CUDA
+name: Build llama.cpp (unsloth iq1-narrow) with CUDA
 
 on:
   schedule:
@@ -7,54 +7,78 @@ on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: 'Force build even if no new release'
+        description: 'Force build even if iq1-narrow tip is unchanged'
         required: false
         type: boolean
         default: false
 
+# ---- Single source of truth for the upstream fork ----
+# Change these two values to retarget the build. They are consumed by every job
+# so there is exactly one place to edit (addresses the "URL scattered everywhere"
+# hazard). scripts/build.sh and scripts/test-build.sh receive them as arguments.
+env:
+  UPSTREAM_REPO: https://github.com/unslothai/llama.cpp
+  UPSTREAM_BRANCH: iq1-narrow
+
 jobs:
-  check-release:
+  check-branch:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      tip_sha: ${{ steps.check.outputs.tip_sha }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
       release_tag: ${{ steps.check.outputs.release_tag }}
-      release_hash: ${{ steps.check.outputs.release_hash }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check for new llama.cpp release
+      - name: Detect new iq1-narrow tip
         id: check
+        env:
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
         run: |
-          # Get latest release from llama.cpp
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
-          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
-          
-          echo "Latest llama.cpp release: $LATEST_RELEASE"
-          echo "Release hash: $RELEASE_HASH"
-          
-          # Check if we've already built this release
-          if git tag | grep -q "^${LATEST_RELEASE}$"; then
-            echo "Release $LATEST_RELEASE already built"
+          set -euo pipefail
+          # The unsloth fork publishes NO GitHub Releases, so the old
+          # /releases/latest + git-tag dedup model does not apply. Instead we
+          # track the branch tip commit SHA and de-duplicate against a tag named
+          # "unsloth-iq1-narrow-<shortsha>".
+          TIP_SHA=$(curl -fsSL \
+            "https://api.github.com/repos/${UPSTREAM_REPO#https://github.com/}/branches/${UPSTREAM_BRANCH}" \
+            | jq -r '.commit.sha')
+          if [ -z "$TIP_SHA" ] || [ "$TIP_SHA" = "null" ]; then
+            echo "Could not resolve tip of ${UPSTREAM_BRANCH}; aborting"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SHORT_SHA="${TIP_SHA:0:7}"
+          TAG="unsloth-${UPSTREAM_BRANCH}-${SHORT_SHA}"
+
+          echo "iq1-narrow tip: ${TIP_SHA} (${SHORT_SHA})"
+          echo "Candidate tag: ${TAG}"
+
+          if git tag | grep -qx "${TAG}"; then
+            echo "Tag ${TAG} already exists"
             if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
               echo "Force build enabled, building anyway"
-              echo "should_build=true" >> $GITHUB_OUTPUT
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
             else
-              echo "should_build=false" >> $GITHUB_OUTPUT
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "New release detected: $LATEST_RELEASE"
-            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "New commit detected, building"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
-          
-          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
-          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+          echo "tip_sha=${TIP_SHA}"     >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${TAG}"     >> "$GITHUB_OUTPUT"
 
   build:
-    needs: check-release
-    if: needs.check-release.outputs.should_build == 'true'
+    needs: check-branch
+    if: needs.check-branch.outputs.should_build == 'true'
     runs-on: ${{ matrix.arch.runs_on }}
     strategy:
       fail-fast: false
@@ -74,7 +98,9 @@ jobs:
             # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
             # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
             architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
-    
+            # unsloth build targets (matches the unsloth quick-start recipe).
+            build_targets: 'llama-cli llama-mtmd-cli llama-server llama-gguf-split'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -112,85 +138,44 @@ jobs:
           df -h
 
       - name: Build llama.cpp with CUDA
+        env:
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          TIP_SHA: ${{ needs.check-branch.outputs.tip_sha }}
         run: |
           # Pull Docker image
           docker pull nvidia/cuda:${{ matrix.cuda_tag }}
-          
-          # Run build in container
+
+          OUTPUT_DIR="/workspace/binaries/cuda-${{ matrix.cuda_version_short }}"
+          # Run the SHARED build recipe (scripts/build.sh) inside the container.
           docker run --rm \
-            -v $PWD:/workspace \
+            -v "$PWD":/workspace \
             nvidia/cuda:${{ matrix.cuda_tag }} \
-            bash -c "
-              set -e
-              
-              echo '=== Installing minimal dependencies ==='
-              apt-get update -qq
-              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
-              apt-get clean
-              rm -rf /var/lib/apt/lists/*
-              
-              echo '=== Cloning llama.cpp ==='
-              cd /workspace
-              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
-                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
-              cd llama.cpp
-              
-              echo '=== Configuring build with Ninja ==='
-              export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+            bash /workspace/scripts/build.sh \
+              "${OUTPUT_DIR}" \
+              '${{ matrix.architectures }}' \
+              "${UPSTREAM_REPO}" \
+              "${TIP_SHA}" \
+              '${{ matrix.cuda_version_short }}' \
+              '${{ matrix.build_targets }}' \
+              'OFF'
 
-              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-              cmake -B build -S . \
-                -G Ninja \
-                -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_SHARED_LIBS=ON \
-                -DGGML_NATIVE=OFF \
-                -DLLAMA_BUILD_TESTS=OFF \
-                -DLLAMA_BUILD_EXAMPLES=OFF \
-                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
-              
-              echo '=== Building with Ninja (parallel: all cores) ==='
-              cmake --build build --config Release -j\$(nproc)
-              
-              echo '=== Copying binaries ==='
-              cd /workspace
-              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
-
-              # Copy everything from build/bin
-              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
-
-              # Strip binaries to reduce size (executables only, not .so files)
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
-
-              echo '=== Creating version info ==='
-              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-
-              echo '=== Build complete ==='
-              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
-              
-              echo '=== Cleaning up build directory ==='
-              rm -rf llama.cpp
-            "
-          
           # Remove Docker image to free space
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          
+
           # Fix permissions for files created by root in container
-          sudo chown -R $(id -u):$(id -g) $PWD
-          
+          sudo chown -R "$(id -u):$(id -g)" "$PWD"
+
+          echo "=== Cleaning up cloned source ==="
+          rm -rf llama.cpp
+
           echo "=== Final disk usage ==="
           df -h
 
       - name: Create tarball
         run: |
           cd binaries
-          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          tar -czf llama.cpp-unsloth-${{ needs.check-branch.outputs.short_sha }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
           ls -lh *.tar.gz
 
       - name: Upload artifact
@@ -203,7 +188,7 @@ jobs:
           retention-days: 1
 
   release:
-    needs: [check-release, build]
+    needs: [check-branch, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -229,38 +214,38 @@ jobs:
       - name: Create advancing release tag
         # GitHub sorts the /releases list by each release's created_at, which is
         # the *committer date of the tag's target commit* — not the publish
-        # time. Previously softprops/action-gh-release created every tag at the
-        # static main HEAD (unchanged since May 2026), so every release reported
-        # the same created_at and the /releases list stopped reflecting recency:
-        # API consumers polling the first page never saw newer builds. Anchor
-        # each tag to a fresh empty commit whose committer date is build time so
-        # created_at advances and new releases sort to the top of the list.
+        # time. Anchor each tag to a fresh empty commit whose committer date is
+        # build time so created_at advances and new releases sort to the top.
         # The commit is reachable only via its tag; main is never pushed.
         run: |
           set -euo pipefail
-          TAG="${{ needs.check-release.outputs.release_tag }}"
+          TAG="${{ needs.check-branch.outputs.release_tag }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty \
-            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            -m "unsloth llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
           git tag "${TAG}"
           git push origin "refs/tags/${TAG}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ needs.check-release.outputs.release_tag }}
-          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
+          tag_name: ${{ needs.check-branch.outputs.release_tag }}
+          name: unsloth llama.cpp (iq1-narrow ${{ needs.check-branch.outputs.short_sha }}) with CUDA
           body: |
-            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
-            
-            Pre-built binaries of llama.cpp with CUDA support for multiple CUDA versions.
-            
-            **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
-            **Commit:** ${{ needs.check-release.outputs.release_hash }}
-            
-            ## CUDA Versions
-            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
+            # unsloth llama.cpp `iq1-narrow` with CUDA Support
+
+            Pre-built binaries of the [unsloth fork](https://github.com/unslothai/llama.cpp) `iq1-narrow` branch, built with CUDA support.
+
+            **Source:** https://github.com/unslothai/llama.cpp/tree/iq1-narrow
+            **Commit:** ${{ needs.check-branch.outputs.tip_sha }}
+
+            > This build tracks the `iq1-narrow` **branch tip**, not upstream GitHub Releases. The tag name embeds the short commit SHA (`unsloth-iq1-narrow-<sha>`).
+
+            ## Build configuration
+            - `BUILD_SHARED_LIBS=OFF` (standalone static executables)
+            - Targets: `llama-cli`, `llama-mtmd-cli`, `llama-server`, `llama-gguf-split`
+            - CUDA 12.8 — GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
 
             ## Host architectures
             Tarballs are published per host CPU architecture (Linux):
@@ -280,9 +265,10 @@ jobs:
             Download the tarball matching your host CPU arch and CUDA version, then extract:
             ```bash
             # amd64 host
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
+            tar -xzf llama.cpp-unsloth-${{ needs.check-branch.outputs.short_sha }}-cuda-12.8-amd64.tar.gz
             # arm64 host (e.g. Grace Blackwell)
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
+            tar -xzf llama.cpp-unsloth-${{ needs.check-branch.outputs.short_sha }}-cuda-12.8-arm64.tar.gz
+            cd cuda-12.8
             ./llama-cli --help
             ```
           files: release-assets/*

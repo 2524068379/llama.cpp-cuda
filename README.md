@@ -1,14 +1,18 @@
-# llama.cpp CUDA Builds
+# llama.cpp CUDA Builds (unsloth `iq1-narrow` fork)
 
-This repository automatically builds [llama.cpp](https://github.com/ggml-org/llama.cpp) with CUDA support for multiple NVIDIA GPU architectures and CUDA versions.
+This repository automatically builds the **[unsloth fork](https://github.com/unslothai/llama.cpp)** of llama.cpp — specifically the [`iq1-narrow`](https://github.com/unslothai/llama.cpp/tree/iq1-narrow) branch — with CUDA support for multiple NVIDIA GPU architectures and CUDA versions.
+
+> ⚠️ Unlike the original `ggml-org` tracker, this repo follows a **branch tip** (commit SHA), not upstream GitHub Releases. The unsloth fork does not publish releases, so each build is keyed to the `iq1-narrow` branch's latest commit.
 
 ## Why This Repository?
 
-The official llama.cpp repository does not provide pre-built CUDA binaries. This repository fills that gap by:
+The official llama.cpp repository does not provide pre-built CUDA binaries. This repository fills that gap for the unsloth fork by:
 
-- Building llama.cpp with CUDA support for multiple CUDA toolkit versions
+- Building the `iq1-narrow` branch with CUDA support
+- Producing **standalone static executables** (`BUILD_SHARED_LIBS=OFF`) — no `.so` dependencies to ship
+- Building exactly the unsloth targets: `llama-cli`, `llama-mtmd-cli`, `llama-server`, `llama-gguf-split`
 - Supporting a wide range of NVIDIA GPU architectures (compute capability 7.5+)
-- Automatically tracking upstream llama.cpp releases
+- Automatically tracking new commits on `iq1-narrow`
 - Providing ready-to-use binaries via GitHub releases
 
 ## Supported Configurations
@@ -31,8 +35,6 @@ The CUDA compute capabilities below target the runtime GPU and are the same on b
 
 | Compute Capability | GPU Examples |
 |-------------------|--------------|
-| 6.1 | Titan XP, Tesla P40, GTX 10xx |
-| 7.0 | Tesla V100 |
 | 7.5 | Tesla T4, RTX 2000 series, Quadro RTX |
 | 8.0 | A100 |
 | 8.6 | RTX 3000 series |
@@ -46,37 +48,38 @@ The CUDA compute capabilities below target the runtime GPU and are the same on b
 ### Download
 
 1. Go to the [Releases](../../releases) page
-2. Download the tarball matching your host CPU architecture — `-amd64` for x86_64, `-arm64` for aarch64. Filename format: `llama.cpp-bXXXX-cuda-<cuda>-<arch>.tar.gz`
+2. Download the tarball matching your host CPU architecture — `-amd64` for x86_64, `-arm64` for aarch64. Filename format: `llama.cpp-unsloth-<shortsha>-cuda-<cuda>-<arch>.tar.gz`
 3. Extract the archive:
 
 ```bash
 # x86_64 host
-tar -xzf llama.cpp-bXXXX-cuda-12.8-amd64.tar.gz
+tar -xzf llama.cpp-unsloth-<shortsha>-cuda-12.8-amd64.tar.gz
 # aarch64 host (e.g. Grace Blackwell, DGX Spark)
-tar -xzf llama.cpp-bXXXX-cuda-12.8-arm64.tar.gz
+tar -xzf llama.cpp-unsloth-<shortsha>-cuda-12.8-arm64.tar.gz
 cd cuda-12.8
 ```
 
 ### Run
 
-The extracted directory contains all llama.cpp binaries:
+The extracted directory contains the standalone executables:
 
 ```bash
-# Run the main CLI
+# CLI
 ./llama-cli --help
 
-# Run the server
+# Multimodal CLI
+./llama-mtmd-cli --help
+
+# OpenAI-compatible API server
 ./llama-server --help
 
-# Other utilities
-./llama-bench
-./llama-quantize
-./llama-embedding
+# GGUF split / merge utility
+./llama-gguf-split --help
 ```
 
 ### Check Version
 
-Each release includes a `VERSION.txt` file with build information:
+Each release includes a `VERSION.txt` file with build information (commit SHA, CUDA version, architectures, build date):
 
 ```bash
 cat VERSION.txt
@@ -85,52 +88,46 @@ cat VERSION.txt
 ## System Requirements
 
 - NVIDIA GPU with compute capability 7.5 or higher
-- Appropriate NVIDIA driver for your CUDA version:
-  - CUDA 12.8+: Driver >= 570.15
+- NVIDIA driver >= 570.15 (CUDA 12.8)
 - Linux x86_64 or aarch64 (Ubuntu 22.04 compatible)
 
 ## Build Process
 
 Builds are triggered automatically:
 - Daily at 00:00 UTC
-- Only if a new llama.cpp release is detected
-- Can be manually triggered via GitHub Actions
+- Only if the `iq1-narrow` branch tip has advanced to a commit we have not yet built
+- Can be manually triggered (with optional `force_build`) via GitHub Actions
 
 Each build:
-1. Checks for new llama.cpp releases
-2. Clones llama.cpp at the exact release commit
-3. Builds with CMake using CUDA Docker images
-4. Packages binaries for each CUDA version
-5. Creates a GitHub release with all build artifacts
+1. Resolves the `iq1-narrow` branch tip commit SHA
+2. De-duplicates against the tag `unsloth-iq1-narrow-<shortsha>`
+3. Clones the unsloth fork at that exact commit
+4. Builds with CMake + Ninja inside the CUDA Docker image, calling the shared recipe in `scripts/build.sh`
+5. Packages standalone executables per host architecture
+6. Creates a GitHub release tagged with the short commit SHA
 
-## Choosing Your CUDA Version
-
-Select based on:
-1. **Your GPU architecture** - Blackwell GPUs require CUDA 12.8+
-2. **Your installed CUDA toolkit** - Match the version if possible
-3. **Your NVIDIA driver** - Ensure your driver supports the CUDA version
-
-If unsure, CUDA 12.6.3 offers the widest compatibility with modern GPUs (except Blackwell).
+The build recipe lives in **`scripts/build.sh`** and is the single source of truth shared by both CI and the local test script, so they can never silently drift apart.
 
 ## Manual Building
-
-If you need a custom build:
 
 ```bash
 git clone https://github.com/ai-dock/llama.cpp-cuda
 cd llama.cpp-cuda
 
-# Edit .github/workflows/build-cuda.yml to customize architectures or CUDA versions
-# Then trigger a manual workflow run
+# Reproduce the CI build locally (requires Docker):
+scripts/test-build.sh                       # defaults: CUDA 12.8.1, iq1-narrow
+scripts/test-build.sh 12.8.1 iq1-narrow     # explicit
+
+# Or trigger a manual workflow run on GitHub Actions.
 ```
 
 ## License
 
-This repository contains build scripts only. The llama.cpp binaries are subject to the [llama.cpp MIT License](https://github.com/ggml-org/llama.cpp/blob/master/LICENSE).
+This repository contains build scripts only. The llama.cpp binaries are subject to the [llama.cpp MIT License](https://github.com/unslothai/llama.cpp/blob/iq1-narrow/LICENSE).
 
 ## Links
 
-- **Upstream llama.cpp**: https://github.com/ggml-org/llama.cpp
+- **Upstream (unsloth fork)**: https://github.com/unslothai/llama.cpp/tree/iq1-narrow
 - **CUDA Toolkit**: https://developer.nvidia.com/cuda-toolkit
 - **NVIDIA Driver Downloads**: https://www.nvidia.com/download/index.aspx
 
@@ -138,9 +135,10 @@ This repository contains build scripts only. The llama.cpp binaries are subject 
 
 For issues with:
 - **Build process or binaries**: Open an issue in this repository
-- **llama.cpp functionality**: Open an issue in the [upstream repository](https://github.com/ggml-org/llama.cpp/issues)
+- **llama.cpp functionality**: Open an issue in the [upstream fork](https://github.com/unslothai/llama.cpp/issues)
 
 ## Credits
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) by Georgi Gerganov and contributors
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) by Georgi Gerganov and contributors
+- [unsloth](https://github.com/unslothai/llama.cpp) fork maintainers
 - Built and maintained by [ai-dock](https://github.com/ai-dock)

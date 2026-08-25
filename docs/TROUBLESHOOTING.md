@@ -266,11 +266,11 @@ cat VERSION.txt
 ### Where to ask
 
 - **Build issues:** Open issue in this repository
-- **llama.cpp functionality:** [llama.cpp issues](https://github.com/ggml-org/llama.cpp/issues)
+- **llama.cpp functionality:** [unsloth fork issues](https://github.com/unslothai/llama.cpp/issues)
 - **CUDA/driver issues:** [NVIDIA Developer Forums](https://forums.developer.nvidia.com/)
 
 ## Additional Resources
 
 - [GPU Compatibility Guide](GPU-COMPATIBILITY.md)
-- [llama.cpp Documentation](https://github.com/ggml-org/llama.cpp/tree/master/docs)
+- [llama.cpp Documentation](https://github.com/unslothai/llama.cpp/tree/iq1-narrow/docs)
 - [NVIDIA CUDA Troubleshooting](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)

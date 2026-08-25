@@ -1,0 +1,10 @@
+# Normalize text files in the repo
+* text=auto
+
+# Shell scripts must keep LF endings (they run inside Linux Docker containers;
+# CRLF would break the #!/usr/bin/env bash shebang).
+*.sh text eol=lf
+
+# Workflow files are also executed on Linux runners; enforce LF.
+*.yml  text eol=lf
+*.yaml text eol=lf

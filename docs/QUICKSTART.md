@@ -33,18 +33,21 @@ Compare against [minimum driver versions](GPU-COMPATIBILITY.md#minimum-cuda-driv
 ## Step 3: Download Binaries
 
 1. Go to [Releases](../../releases/latest)
-2. Download the tarball for your CUDA version, e.g.:
+2. Download the tarball for your host architecture and CUDA version, e.g.:
    ```bash
-   wget https://github.com/ai-dock/llama.cpp-cuda/releases/download/bXXXX/llama.cpp-bXXXX-cuda-12.6.3.tar.gz
+   # amd64 (x86_64) host
+   wget https://github.com/ai-dock/llama.cpp-cuda/releases/download/unsloth-iq1-narrow-XXXXXXX/llama.cpp-unsloth-XXXXXXX-cuda-12.8-amd64.tar.gz
+   # arm64 (aarch64) host
+   wget https://github.com/ai-dock/llama.cpp-cuda/releases/download/unsloth-iq1-narrow-XXXXXXX/llama.cpp-unsloth-XXXXXXX-cuda-12.8-arm64.tar.gz
    ```
+   Replace `XXXXXXX` with the short commit SHA shown on the release.
 
-**Not sure which version?** Use CUDA 12.6.3 for most systems.
-
+**Not sure which version?** Use the CUDA 12.8 build for your host CPU arch (most systems are `-amd64`).
 ## Step 4: Extract
 
 ```bash
-tar -xzf llama.cpp-bXXXX-cuda-12.6.3.tar.gz
-cd cuda-12.6.3
+tar -xzf llama.cpp-unsloth-XXXXXXX-cuda-12.8-amd64.tar.gz
+cd cuda-12.8
 ```
 
 ## Step 5: Download a Model
@@ -149,8 +152,8 @@ See the [Troubleshooting Guide](TROUBLESHOOTING.md) for detailed solutions.
 
 - 📖 Read the [full documentation](../README.md)
 - 🔧 Check [GPU compatibility](GPU-COMPATIBILITY.md)
-- 🎯 Learn more [llama.cpp options](https://github.com/ggml-org/llama.cpp/blob/master/examples/main/README.md)
-- 🚀 Run the [server](https://github.com/ggml-org/llama.cpp/tree/master/examples/server)
+- 🎯 Learn more [llama.cpp options](https://github.com/unslothai/llama.cpp/blob/iq1-narrow/examples/main/README.md)
+- 🚀 Run the [server](https://github.com/unslothai/llama.cpp/tree/iq1-narrow/examples/server)
 
 ## Benchmark Your Setup
 
@@ -165,6 +168,6 @@ See the [Troubleshooting Guide](TROUBLESHOOTING.md) for detailed solutions.
 ## Getting Help
 
 - Build issues: [Open an issue](../../issues)
-- llama.cpp questions: [llama.cpp discussions](https://github.com/ggml-org/llama.cpp/discussions)
+- llama.cpp questions: [unsloth fork discussions/issues](https://github.com/unslothai/llama.cpp/issues)
 
 Happy prompting! 🦙
