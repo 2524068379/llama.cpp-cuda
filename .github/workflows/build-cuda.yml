@@ -31,24 +31,35 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Detect new iq1-narrow tip
         id: check
         env:
-          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_API: ${{ env.UPSTREAM_REPO }}
           UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          UPSTREAM_API="${UPSTREAM_API#https://github.com/}"
+          AUTH=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+
           # The unsloth fork publishes NO GitHub Releases, so the old
           # /releases/latest + git-tag dedup model does not apply. Instead we
-          # track the branch tip commit SHA and de-duplicate against a tag named
-          # "unsloth-iq1-narrow-<shortsha>".
-          TIP_SHA=$(curl -fsSL \
-            "https://api.github.com/repos/${UPSTREAM_REPO#https://github.com/}/branches/${UPSTREAM_BRANCH}" \
-            | jq -r '.commit.sha')
-          if [ -z "$TIP_SHA" ] || [ "$TIP_SHA" = "null" ]; then
+          # track the branch tip commit SHA and de-duplicate against an
+          # existing RELEASE (via the Releases API), not a git tag.
+          #
+          # Why Releases-API dedup instead of `git tag`?
+          #  - actions/checkout@v4 fetches NO tags by default, so `git tag`
+          #    would be empty and we would rebuild every single cron run.
+          #  - Gating on release existence means the check agrees with the
+          #    release job: if the tag was pushed but release creation failed
+          #    (orphaned tag), the next run still sees "no release" and
+          #    rebuilds/retries automatically — self-healing.
+          TIP_SHA=$(curl -fsSL "${AUTH[@]}" \
+            "https://api.github.com/repos/${UPSTREAM_API}/branches/${UPSTREAM_BRANCH}" \
+            | jq -r '.commit.sha // empty')
+          if [ -z "${TIP_SHA}" ]; then
             echo "Could not resolve tip of ${UPSTREAM_BRANCH}; aborting"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -59,8 +70,16 @@ jobs:
           echo "iq1-narrow tip: ${TIP_SHA} (${SHORT_SHA})"
           echo "Candidate tag: ${TAG}"
 
-          if git tag | grep -qx "${TAG}"; then
-            echo "Tag ${TAG} already exists"
+          # Query OUR releases for one tagged with this commit's tag.
+          # /releases returns [] (200) when empty, never 404, so this is robust
+          # under set -e. Mirrors scripts/check-releases.sh exactly.
+          EXISTING=$(curl -fsSL "${AUTH[@]}" \
+            "https://api.github.com/repos/${THIS_REPO}/releases?per_page=100" \
+            | jq -r --arg tag "${TAG}" '.[] | select(.tag_name == $tag) | .tag_name' \
+            | head -1)
+
+          if [ -n "${EXISTING}" ]; then
+            echo "Release ${TAG} already exists"
             if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
               echo "Force build enabled, building anyway"
               echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -68,7 +87,7 @@ jobs:
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "New commit detected, building"
+            echo "No release for ${TAG}; building"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -196,9 +215,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Full history + tags so the tag push below is a fast-forward and
-          # duplicate tags are visible.
+          # Full history so the empty advancing commit below sits on top of
+          # main HEAD. fetch-tags lets us see pre-existing tags (belt-and-
+          # suspenders; the force push below handles collisions regardless).
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -224,8 +245,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty \
             -m "unsloth llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
-          git tag "${TAG}"
-          git push origin "refs/tags/${TAG}"
+          # Force-create the tag so a re-run (force_build, or retry after a
+          # failed release step) overwrites a previously-pushed tag for the
+          # same commit instead of failing with non-fast-forward.
+          git tag -f "${TAG}"
+          git push --force origin "refs/tags/${TAG}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
